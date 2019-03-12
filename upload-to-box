@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from io import BytesIO
+from itertools import chain
+from tempfile import NamedTemporaryFile
+
+import pycurl
+import pymysql
+
+ARCHIVE = '/opt/backups/scratch/archive'
+BOX_EMAILS = [
+    'wporr@ocf.berkeley.edu',
+]
+# This still use FTPS (over TLS) since we run curl with the -1 option
+BOX_FTP = 'ftp://ftp.box.com'
+FOLDER = 'backup-' + time.strftime('%Y-%m-%d')
+
+# To get the OAuth keys for an account:
+#
+# Mostly taken from https://goo.gl/bXdrPE
+#
+# Secrets like client_id, client_secret, and user email/password are in the
+# puppetmaster's private store and on hal in /opt/share/backups/box-creds.json.
+#
+# First, go to
+# https://account.box.com/api/oauth2/authorize?response_type=code&client_id={your_api_key}&state=authenticated&redirect_uri=https://www.ocf.berkeley.edu/oauth
+# You will get redirected to a 404 page, but you can get an auth code from that
+# page's URL. This auth code doesn't last very long at all, so run the below
+# command quickly. Otherwise, just go back to the same page and do it again.
+#
+# Quickly run: curl https://app.box.com/api/oauth2/token -X POST -d \
+# 'grant_type=authorization_code&code={auth code from above}&client_id={client id}&client_secret={client secret}'
+# Get the refresh token from this command's return, it can be used for up to
+# 60 days or one use before it expires. Once used, it is replaced by another
+# token, so it is stored in a database (ocfbackups) and overwritten each time a
+# new one is returned (when the old one is used). Access tokens only last for
+# around an hour before expiring, so they are only stored in this program's
+# memory and are generated using the refresh token.
+
+
+def box_api_call(url, data='', headers=[], method=''):
+    """Make an API call to Box.com (or anywhere really)"""
+    conn = pycurl.Curl()
+
+    response_data = BytesIO()
+    conn.setopt(conn.URL, url)
+    conn.setopt(conn.WRITEDATA, response_data)
+    conn.setopt(conn.HTTPHEADER, headers)
+
+    if data:
+        conn.setopt(conn.POSTFIELDS, data)
+
+    if method:
+        conn.setopt(conn.CUSTOMREQUEST, method)
+
+    conn.perform()
+    http_status = conn.getinfo(pycurl.HTTP_CODE)
+    conn.close()
+
+    # Check if HTTP status is in 2XX (success of some sort)
+    if 200 <= http_status < 300:
+        return json.loads(response_data.getvalue().decode('utf-8'))
+    else:
+        print('HTTP {} on {} with {}'.format(http_status, url, data))
+        sys.exit(1)
+
+
+def get_access_token(creds):
+    """Gets a new access token for the Box.com API"""
+
+    # Connect to mysql to retrieve the refresh token
+    connection = pymysql.connect(
+        host='mysql.ocf.berkeley.edu',
+        user='ocfbackups',
+        password=creds['mysql_password'],
+        db='ocfbackups',
+        autocommit=True,
+    )
+
+    with connection as c:
+        c.execute('SELECT `value` FROM `box_keys` WHERE `name` = "refresh-token"')
+        refresh_token = c.fetchone()[0]
+
+        # Get an access token and a new refresh token from the API
+        post_data = '&refresh_token={}&client_id={}&client_secret={}'.format(
+            refresh_token,
+            creds['api_client_id'],
+            creds['api_client_secret']
+        )
+        response = box_api_call('https://app.box.com/api/oauth2/token',
+                                data='grant_type=refresh_token' + post_data)
+
+        # Write the new refresh token to the database
+        c.execute("UPDATE `box_keys` SET `value` = %s WHERE `name` = 'refresh-token'", response['refresh_token'])
+
+        return response['access_token']
+
+
+def upload_to_box(creds, quiet):
+    """Uploads the archive to box at the configured location"""
+
+    # Specify each file and its destination on the command line
+    # -T file1 ftp://.../destfolder/ -T file2 ftp://.../destfolder/ ...
+    file_args = chain.from_iterable(
+        (
+            '-T',
+            os.path.join(ARCHIVE, filename),
+            '{}/{}/'.format(BOX_FTP, FOLDER),
+        )
+        for filename in os.listdir(ARCHIVE)
+    )
+
+    if quiet:
+        stdout_pipe = subprocess.DEVNULL
+    else:
+        stdout_pipe = None
+
+    # curl takes credentials with a "netrc file"
+    netrc_creds = 'machine ftp.box.com login {email} password {passwd}'.format(
+        email=creds['email'],
+        passwd=creds['password'],
+    )
+    with NamedTemporaryFile(mode='w', delete=True) as netrc_file:
+        netrc_file.write(netrc_creds)
+        netrc_file.flush()
+
+        subprocess.run(
+            [
+                'curl',
+                '-1',
+                '--disable-epsv',
+                '--ftp-skip-pasv-ip',
+                '--ftp-ssl',
+                '--netrc-file', netrc_file.name,
+                '--ftp-create-dirs',
+                '--globoff',
+                *file_args,
+            ],
+            check=True,
+            stdout=stdout_pipe,
+        )
+
+
+def get_folder_id(access_token, folder_name):
+    """Get the ID for a folder with a specific name in the root folder"""
+    response = box_api_call('https://api.box.com/2.0/folders/0/items?limit=1000',
+                            headers=['Authorization: Bearer ' + access_token])
+
+    for entry in response['entries']:
+        if entry['name'] == folder_name and entry['type'] == 'folder':
+            return entry['id']
+
+
+def add_collaborators(access_token, folder_id, emails):
+    """Set a list of people who can access the folder with the backups"""
+    for email in emails:
+        data = json.dumps({
+            'item': {'id': folder_id, 'type': 'folder'},
+            'accessible_by': {'login': email, 'type': 'user'},
+            'role': 'viewer',
+        })
+
+        box_api_call('https://api.box.com/2.0/collaborations?notify=false',
+                     data=data,
+                     headers=['Authorization: Bearer ' + access_token],
+                     method='POST')
+
+        # Try not to spam Box.com too hard
+        time.sleep(1.0)
+
+
+def get_shared_link(access_token, folder_id):
+    """Get a download link to the folder where the upload was made"""
+    # A password can be set on the shared link, but the data is encrypted
+    # with keys anyway, so why bother? Also the link is only shared with
+    # certain emails, so the password is pretty unnecessary.
+    response = box_api_call('https://api.box.com/2.0/folders/' + folder_id,
+                            data='{"shared_link": {"access": "collaborators"}}',
+                            headers=['Authorization: Bearer ' + access_token],
+                            method='PUT')
+
+    return response['shared_link']['url']
+
+
+def friendly_time(seconds):
+    """Show seconds in terms of larger units for easier reading"""
+    times = [('seconds', 60), ('minutes', 60), ('hours', 24), ('days', 365)]
+    for unit, factor in times:
+        if seconds < factor:
+            return '{:.2f} {}'.format(seconds, unit)
+        seconds /= factor
+
+
+def main(args):
+    try:
+        files = sorted(os.listdir(ARCHIVE))
+    except PermissionError:
+        print('You must run this script as root!')
+        sys.exit(1)
+
+    # Make sure there are actually files to upload
+    assert files, 'No files found to upload, check your path'
+
+    # Get authentication for Box.com from credentials file
+    with open('/opt/share/backups/box-creds.json') as f:
+        creds = json.load(f)
+
+    # Used for statistics, shown at the end of the run.
+    start_time = time.time()
+    file_bytes = sum(os.path.getsize(ARCHIVE + '/' + f) for f in files)
+    if not args.quiet:
+        print('Uploading {}...'.format(file_bytes))
+
+    upload_to_box(creds, args.quiet)
+
+    # Get a shared link from Box.com's API and share it with certain emails
+    # Uncomment once we know how to get access tokens
+#    access_token = get_access_token(creds)
+#    folder_id = get_folder_id(access_token, FOLDER)
+#    add_collaborators(access_token, folder_id, BOX_EMAILS)
+#    link = get_shared_link(access_token, folder_id)
+
+    # Print statistics about the backup time, size, and speed
+    total_time = time.time() - start_time
+    transfer_rate = file_bytes / (1000000 * total_time)
+    print('Box.com upload complete!')
+    print('Took {} to transfer {} files with combined size {}'.format(
+        friendly_time(total_time),
+        len(files),
+        humanize_bytes(file_bytes)
+    ))
+    print('Average rate of {:.2f} Mb/s ({:.2f} MB/s)'.format(
+        transfer_rate * 8,
+        transfer_rate
+    ))
+#    print('Link to the uploaded folder: {}'.format(link))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Back up files to Box.com')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='do not output progress or temporary errors to stdout')
+
+    args = parser.parse_args()
+
+    exit(main(args))
